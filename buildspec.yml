@@ -1,0 +1,74 @@
+# AWS CodeBuild build specification for the Payment App.
+#
+# Stages: build the React frontend, then compile + test + package the Spring Boot
+# backend. JaCoCo enforces the 80% line-coverage gate during `mvn verify` (see the
+# jacoco-maven-plugin `check` execution in backend/pom.xml). When SONAR_TOKEN /
+# SONAR_HOST_URL are provided, a SonarQube analysis is also run.
+version: 0.2
+
+env:
+  variables:
+    JAVA_HOME: "/usr/lib/jvm/java-11-amazon-corretto"
+  # Provide these via CodeBuild project env / Secrets Manager to enable SonarQube:
+  #   SONAR_HOST_URL, SONAR_TOKEN
+  parameter-store: {}
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto11
+      nodejs: 20
+    commands:
+      - echo "Toolchain:" && java -version && node -v && npm -v
+
+  pre_build:
+    commands:
+      - echo "Installing frontend dependencies..."
+      - cd frontend && npm ci && cd ..
+
+  build:
+    commands:
+      - echo "Building + testing frontend..."
+      - cd frontend
+      - npm run build
+      - echo "Running frontend tests with coverage..."
+      - npx vitest run --coverage --reporter=default --reporter=junit --outputFile=test-report.junit.xml
+      - cd ..
+      - echo "Building + testing backend (JaCoCo 80% gate enforced)..."
+      - cd backend
+      - |
+        if [ -n "$SONAR_HOST_URL" ] && [ -n "$SONAR_TOKEN" ]; then
+          echo "Running mvn verify with SonarQube analysis...";
+          mvn -B clean verify sonar:sonar \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.login="$SONAR_TOKEN";
+        else
+          echo "SONAR_* not set — running mvn verify without SonarQube.";
+          mvn -B clean verify;
+        fi
+      - cd ..
+
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+
+reports:
+  jacoco:
+    files:
+      - backend/target/site/jacoco/jacoco.xml
+    file-format: JACOCOXML
+  surefire:
+    files:
+      - backend/target/surefire-reports/*.xml
+    file-format: JUNITXML
+  frontend-tests:
+    files:
+      - frontend/test-report.junit.xml
+    file-format: JUNITXML
+
+artifacts:
+  files:
+    - backend/target/*.jar
+    - backend/Procfile
+    - frontend/dist/**/*
+  discard-paths: no

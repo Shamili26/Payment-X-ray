@@ -1,0 +1,34 @@
+# ───── Git internals (preserved old backend repo, temporarily renamed) ─────
+.git.disabled/
+
+# ───── IDE ─────
+.idea/
+*.iml
+.vscode/
+
+# ───── Build output / dependencies (any depth) ─────
+node_modules/
+target/
+dist/
+coverage/
+*.tsbuildinfo
+*.class
+*.log
+logs/
+
+# ───── Elastic Beanstalk deploy bundles (large build artifacts, ~700MB) ─────
+*.zip
+
+# ───── Redundant duplicate frontend copy (the canonical one is /frontend) ─────
+backend/frontend/
+
+# ───── Local env / secrets (never commit) ─────
+*.env
+.env.*
+!*.env.example
+*.pem
+*.key
+
+# ───── OS ─────
+.DS_Store
+Thumbs.db

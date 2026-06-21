@@ -1,0 +1,61 @@
+# =============================================================================
+#  systemd unit for the Payment App backend (Spring Boot)
+#
+#  Install on a Linux server:
+#    1. Build the jar:        mvn clean package -DskipTests
+#    2. Copy the jar:         sudo cp target/payment-app-backend-1.0.0.jar /opt/payment-app/app.jar
+#    3. Copy this file:       sudo cp deploy/payment-app.service /etc/systemd/system/
+#    4. Create the user:      sudo useradd --system --no-create-home --shell /usr/sbin/nologin payment
+#    5. Create dirs:          sudo mkdir -p /opt/payment-app /var/log/payment-app
+#                             sudo chown -R payment:payment /opt/payment-app /var/log/payment-app
+#    6. Reload + start:       sudo systemctl daemon-reload
+#                             sudo systemctl enable --now payment-app
+#    7. Check status/logs:    sudo systemctl status payment-app
+#                             sudo journalctl -u payment-app -f
+#                             tail -f /var/log/payment-app/payment-app.log
+# =============================================================================
+[Unit]
+Description=Payment App Backend (Spring Boot)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=payment
+Group=payment
+
+# Working directory (relative ./logs would land here if LOG_PATH is unset).
+WorkingDirectory=/opt/payment-app
+
+# --- Environment ------------------------------------------------------------
+# Where log files are written (read by logback-spring.xml).
+Environment=LOG_PATH=/var/log/payment-app
+# Uncomment to emit structured JSON logs (for ELK / Grafana Loki):
+# Environment=SPRING_PROFILES_ACTIVE=json
+# Externalise secrets/overrides instead of editing application.properties:
+# Environment=SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/paymentdb
+# Environment=SPRING_DATASOURCE_USERNAME=postgres
+# Environment=SPRING_DATASOURCE_PASSWORD=change-me
+# Environment=APP_JWT_SECRET=change-me-base64-secret
+
+# Optionally load extra env vars from a protected file (chmod 600).
+# EnvironmentFile=-/etc/payment-app/payment-app.env
+
+ExecStart=/usr/bin/java -jar /opt/payment-app/app.jar
+
+# --- Resilience -------------------------------------------------------------
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=10
+
+# --- Security hardening ------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+# Allow writing only to the log directory under the protected filesystem.
+ReadWritePaths=/var/log/payment-app
+
+[Install]
+WantedBy=multi-user.target
+

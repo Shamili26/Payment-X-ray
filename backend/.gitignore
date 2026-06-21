@@ -1,0 +1,19 @@
+# --- Application logs ---
+logs/
+*.log
+*.log.gz
+
+# --- Node dependencies ---
+node_modules/
+
+# --- Maven build output ---
+target/
+
+# --- Elastic Beanstalk deploy bundles ---
+payment-app-eb*.zip
+
+# --- IDE / OS noise ---
+.idea/
+*.iml
+.DS_Store
+
