@@ -1,15 +1,24 @@
-# AWS CodeBuild build specification for the Payment App.
+# AWS CodeBuild build specification — Payment App BACKEND.
 #
-# Stages: build the React frontend, then compile + test + package the Spring Boot
-# backend. JaCoCo enforces the 80% line-coverage gate during `mvn verify` (see the
-# jacoco-maven-plugin `check` execution in backend/pom.xml). When SONAR_TOKEN /
-# SONAR_HOST_URL are provided, a SonarQube analysis is also run.
+# Used by the CodePipeline "Build" stage (see infra/codepipeline-backend.yaml).
+# Compiles + tests + packages the Spring Boot backend and emits an Elastic
+# Beanstalk source bundle that the pipeline's Deploy stage ships to EB.
+#
+#   * JaCoCo enforces the 80% line-coverage gate during `mvn verify`
+#     (jacoco-maven-plugin `check` execution in backend/pom.xml).
+#   * When SONAR_TOKEN / SONAR_HOST_URL are provided, a SonarQube analysis runs.
+#   * The EB Procfile is REGENERATED from the POM version and asserted, so the
+#     jar name and the prod/region flags can never drift (the recurring 502 bug).
+#
+# The frontend is built + deployed separately by AWS Amplify Hosting
+# (see frontend/amplify.yml) and is intentionally NOT built here.
 version: 0.2
 
 env:
   variables:
     JAVA_HOME: "/usr/lib/jvm/java-11-amazon-corretto"
-  # Provide these via CodeBuild project env / Secrets Manager to enable SonarQube:
+    AWS_REGION_TARGET: "us-east-1"
+  # Provide these via the CodeBuild project env / Secrets Manager to enable SonarQube:
   #   SONAR_HOST_URL, SONAR_TOKEN
   parameter-store: {}
 
@@ -17,23 +26,11 @@ phases:
   install:
     runtime-versions:
       java: corretto11
-      nodejs: 20
     commands:
-      - echo "Toolchain:" && java -version && node -v && npm -v
-
-  pre_build:
-    commands:
-      - echo "Installing frontend dependencies..."
-      - cd frontend && npm ci && cd ..
+      - echo "Toolchain:" && java -version
 
   build:
     commands:
-      - echo "Building + testing frontend..."
-      - cd frontend
-      - npm run build
-      - echo "Running frontend tests with coverage..."
-      - npx vitest run --coverage --reporter=default --reporter=junit --outputFile=test-report.junit.xml
-      - cd ..
       - echo "Building + testing backend (JaCoCo 80% gate enforced)..."
       - cd backend
       - |
@@ -46,11 +43,26 @@ phases:
           echo "SONAR_* not set — running mvn verify without SonarQube.";
           mvn -B clean verify;
         fi
+      # --- Resolve the artifact version straight from the POM ------------------
+      - VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+      - echo "Resolved project version = $VERSION"
+      - test -f "target/payment-app-backend-${VERSION}.jar" || { echo "ERROR: expected jar target/payment-app-backend-${VERSION}.jar not found"; exit 1; }
+      # --- Regenerate the EB Procfile from that version (never hand-maintained) -
+      # ⚠️ A stale jar version, or a dropped --spring.profiles.active=prod /
+      #    -Daws.region, causes a boot-time 502 / Secrets-Manager failure.
+      - printf 'web: java -Daws.region=%s -jar payment-app-backend-%s.jar --spring.profiles.active=prod --server.port=5000\n' "$AWS_REGION_TARGET" "$VERSION" > Procfile
+      - echo "Generated Procfile:" && cat Procfile
+      # --- Assert the Procfile is correct BEFORE bundling ----------------------
+      - grep -q -- "--spring.profiles.active=prod" Procfile || { echo "ERROR: Procfile missing --spring.profiles.active=prod"; exit 1; }
+      - grep -q -- "-Daws.region=${AWS_REGION_TARGET}" Procfile || { echo "ERROR: Procfile missing -Daws.region=${AWS_REGION_TARGET}"; exit 1; }
+      - grep -q "payment-app-backend-${VERSION}.jar" Procfile || { echo "ERROR: Procfile jar version mismatch"; exit 1; }
+      # --- Assemble the EB source bundle (jar + Procfile + .ebextensions) ------
+      - rm -rf eb-bundle && mkdir -p eb-bundle/.ebextensions
+      - cp "target/payment-app-backend-${VERSION}.jar" eb-bundle/
+      - cp Procfile eb-bundle/
+      - cp -r .ebextensions/. eb-bundle/.ebextensions/
+      - echo "EB bundle contents:" && ls -R eb-bundle
       - cd ..
-
-  post_build:
-    commands:
-      - echo "Build completed on $(date)"
 
 reports:
   jacoco:
@@ -61,14 +73,10 @@ reports:
     files:
       - backend/target/surefire-reports/*.xml
     file-format: JUNITXML
-  frontend-tests:
-    files:
-      - frontend/test-report.junit.xml
-    file-format: JUNITXML
 
+# The output artifact root = the EB source bundle. CodePipeline zips this and the
+# Elastic Beanstalk deploy action uses it directly as the application version.
 artifacts:
+  base-directory: backend/eb-bundle
   files:
-    - backend/target/*.jar
-    - backend/Procfile
-    - frontend/dist/**/*
-  discard-paths: no
+    - "**/*"
