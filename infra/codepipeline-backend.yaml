@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CI/CD for the Payment App BACKEND. Source (GitHub via CodeConnections) ->
+  Build (CodeBuild, buildspec.yml: test + JaCoCo gate + EB bundle) ->
+  Deploy (Elastic Beanstalk). The frontend is handled separately by AWS Amplify
+  Hosting (see frontend/amplify.yml).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: payment-app-backend
+  GitHubConnectionArn:
+    Type: String
+    Default: arn:aws:codeconnections:us-east-1:975049988202:connection/6605bf57-aeb1-44ae-b865-cd688d8cc413
+    Description: Pre-created & AUTHORIZED CodeConnections (GitHub) connection ARN.
+  FullRepositoryId:
+    Type: String
+    Default: Shamili26/Payment-X-ray
+    Description: owner/repo
+  BranchName:
+    Type: String
+    Default: main
+  EbApplicationName:
+    Type: String
+    Default: PaymentApp
+  EbEnvironmentName:
+    Type: String
+    Default: PaymentApp-env
+  # Optional SonarQube wiring; leave blank to skip Sonar analysis in the build.
+  SonarHostUrl:
+    Type: String
+    Default: ""
+  SonarToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+
+Conditions:
+  HasSonar: !Not [!Equals [!Ref SonarHostUrl, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-pipeline-artifacts-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ------------------------------------------------------------ CodeBuild role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}*"
+
+  # --------------------------------------------------------------- build project
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - !If
+            - HasSonar
+            - { Name: SONAR_HOST_URL, Value: !Ref SonarHostUrl }
+            - !Ref AWS::NoValue
+          - !If
+            - HasSonar
+            - { Name: SONAR_TOKEN, Value: !Ref SonarToken }
+            - !Ref AWS::NoValue
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      TimeoutInMinutes: 30
+
+  # ----------------------------------------------------------- CodePipeline role
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # artifact bucket
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # GitHub source via CodeConnections
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              # drive the build
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: !GetAtt BuildProject.Arn
+              # Elastic Beanstalk deploy action (broad set required by the EB provider)
+              - Effect: Allow
+                Action:
+                  - elasticbeanstalk:*
+                  - autoscaling:*
+                  - ec2:Describe*
+                  - elasticloadbalancing:Describe*
+                  - cloudwatch:*
+                  - s3:*
+                  - cloudformation:*
+                  - rds:Describe*
+                  - sns:*
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: [elasticbeanstalk.amazonaws.com, ec2.amazonaws.com]
+
+  # ------------------------------------------------------------------- pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: "true"
+              OutputArtifacts: [{ Name: SourceArtifact }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceArtifact }]
+              OutputArtifacts: [{ Name: BuildArtifact }]
+        - Name: Deploy
+          Actions:
+            - Name: DeployToBeanstalk
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ElasticBeanstalk
+                Version: "1"
+              Configuration:
+                ApplicationName: !Ref EbApplicationName
+                EnvironmentName: !Ref EbEnvironmentName
+              InputArtifacts: [{ Name: BuildArtifact }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket

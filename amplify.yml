@@ -1,0 +1,55 @@
+# AWS Amplify Hosting build specification — Payment App FRONTEND.
+#
+# Amplify connects directly to the GitHub repo and runs this on every push:
+# branch builds deploy (main -> production), and PRs get preview builds. The
+# backend is built/deployed separately by CodePipeline (see buildspec.yml +
+# infra/codepipeline-backend.yaml).
+#
+# Monorepo layout: the SPA lives in frontend/, so appRoot is set below. In the
+# Amplify console enable "monorepo" (or it is auto-detected from this file).
+#
+# Guards encoded here (hard-won prod lessons):
+#   * .env.production MUST be BOM-free — a UTF-8 BOM makes Vite silently drop
+#     VITE_API_BASE_URL and the bundle falls back to localhost.
+#   * VITE_API_BASE_URL MUST be /api (same-origin). See the rewrite note in the
+#     setup instructions — Amplify must proxy /api/* to the backend.
+#   * The built bundle must contain NO hardcoded elasticbeanstalk API host
+#     (mixed content + dropped Secure cookie).
+version: 1
+applications:
+  - appRoot: frontend
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - echo "Guard 1 — .env.production must be BOM-free"
+            - |
+              if [ -f .env.production ]; then
+                FIRST3=$(head -c 3 .env.production | od -An -tx1 | tr -d ' ')
+                if [ "$FIRST3" = "efbbbf" ]; then
+                  echo "ERROR: .env.production starts with a UTF-8 BOM (EF BB BF)."; exit 1;
+                fi
+              else
+                echo "ERROR: frontend/.env.production missing"; exit 1;
+              fi
+            - echo "Guard 2 — VITE_API_BASE_URL must be /api"
+            - grep -q '^VITE_API_BASE_URL=/api$' .env.production || { echo "ERROR: VITE_API_BASE_URL is not /api"; exit 1; }
+            - npm ci
+        build:
+          commands:
+            - echo "Running tests..."
+            - npm run test
+            - echo "Building production bundle..."
+            - npm run build
+            - echo "Guard 3 — no hardcoded elasticbeanstalk host in the bundle"
+            - |
+              if grep -RqE 'https?://[a-z0-9.-]*elasticbeanstalk' dist/assets; then
+                echo "ERROR: built bundle contains a hardcoded elasticbeanstalk API host"; exit 1;
+              fi
+      artifacts:
+        baseDirectory: dist
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - frontend/node_modules/**/*
