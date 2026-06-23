@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -43,6 +44,14 @@ public class AuthService {
 
     @Value("${app.jwt.expiration-ms}")
     private long jwtExpirationMs;
+
+    // Brute-force lockout: after this many consecutive failed logins the account
+    // is locked for the configured duration.
+    @Value("${app.security.lockout.max-attempts:5}")
+    private int maxFailedAttempts;
+
+    @Value("${app.security.lockout.duration-minutes:15}")
+    private long lockoutDurationMinutes;
 
     // Default opening balance assigned to every newly created account.
     private static final BigDecimal DEFAULT_OPENING_BALANCE = new BigDecimal("1500000.00");
@@ -126,16 +135,54 @@ public class AuthService {
                 .or(() -> userRepository.findByEmail(req.getUsernameOrEmail()))
                 .orElseThrow(() -> new UsernameNotFoundException("Invalid credentials"));
 
-        // Delegates to DaoAuthenticationProvider → BCrypt check
-        authManager.authenticate(
-                new UsernamePasswordAuthenticationToken(user.getUsername(), req.getPassword())
-        );
+        // Delegates to DaoAuthenticationProvider → BCrypt check. A locked account
+        // throws LockedException here (before the password check) and is handled
+        // by AuthController as a 403; a wrong password throws BadCredentials,
+        // which we use to drive the brute-force lockout counter.
+        try {
+            authManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(user.getUsername(), req.getPassword())
+            );
+        } catch (BadCredentialsException ex) {
+            registerFailedLogin(user);
+            throw ex;
+        }
+
+        // Successful login clears any prior failed-attempt / lockout state.
+        if (user.getFailedLoginAttempts() > 0 || user.getLockedUntil() != null) {
+            user.setFailedLoginAttempts(0);
+            user.setLockedUntil(null);
+            userRepository.save(user);
+        }
 
         // Update last login timestamp
         userRepository.updateLastLogin(user.getUserId(), LocalDateTime.now());
 
         log.info("User logged in: {} from {}", user.getUsername(), ipAddress);
         return buildAuthResponse(user, ipAddress, userAgent);
+    }
+
+    /**
+     * Records a failed login. After {@code maxFailedAttempts} consecutive
+     * failures the account is locked for {@code lockoutDurationMinutes}; once
+     * that window passes the next failure starts a fresh count.
+     */
+    private void registerFailedLogin(User user) {
+        final LocalDateTime now = LocalDateTime.now();
+        // A previously-expired lock window starts the count over.
+        int prior = (user.getLockedUntil() != null && user.getLockedUntil().isBefore(now))
+                ? 0 : user.getFailedLoginAttempts();
+        int attempts = prior + 1;
+        user.setFailedLoginAttempts(attempts);
+
+        if (attempts >= maxFailedAttempts) {
+            user.setLockedUntil(now.plusMinutes(lockoutDurationMinutes));
+            log.warn("Account '{}' locked for {} min after {} failed login attempts",
+                    user.getUsername(), lockoutDurationMinutes, attempts);
+        } else {
+            user.setLockedUntil(null);
+        }
+        userRepository.save(user);
     }
 
     // ─── Logout ──────────────────────────────────────────────────────────────

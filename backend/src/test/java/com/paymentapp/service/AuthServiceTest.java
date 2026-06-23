@@ -23,6 +23,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.LocalDateTime;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.*;
@@ -49,6 +50,8 @@ class AuthServiceTest {
     @BeforeEach
     void setUp() {
         ReflectionTestUtils.setField(authService, "jwtExpirationMs", 86400000L);
+        ReflectionTestUtils.setField(authService, "maxFailedAttempts", 5);
+        ReflectionTestUtils.setField(authService, "lockoutDurationMinutes", 15L);
 
         testUser = new User();
         testUser.setUserId(1L);
@@ -208,6 +211,69 @@ class AuthServiceTest {
 
         assertThatThrownBy(() -> authService.login(req, "127.0.0.1", "agent"))
                 .isInstanceOf(BadCredentialsException.class);
+    }
+
+    @Test
+    @DisplayName("a single wrong password increments the failed-attempt counter but does not lock")
+    void login_wrongPassword_incrementsFailedAttempts() {
+        Auth.LoginRequest req = new Auth.LoginRequest();
+        req.setUsernameOrEmail("testuser");
+        req.setPassword("WrongPass");
+
+        when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(testUser));
+        doThrow(new BadCredentialsException("Bad credentials"))
+                .when(authManager).authenticate(any());
+
+        assertThatThrownBy(() -> authService.login(req, "127.0.0.1", "agent"))
+                .isInstanceOf(BadCredentialsException.class);
+
+        assertThat(testUser.getFailedLoginAttempts()).isEqualTo(1);
+        assertThat(testUser.getLockedUntil()).isNull();
+        assertThat(testUser.isAccountNonLocked()).isTrue();
+        verify(userRepository).save(testUser);
+    }
+
+    @Test
+    @DisplayName("reaching the max failed attempts locks the account for the lockout window")
+    void login_reachingMaxAttempts_locksAccount() {
+        testUser.setFailedLoginAttempts(4);   // one short of the 5 threshold
+
+        Auth.LoginRequest req = new Auth.LoginRequest();
+        req.setUsernameOrEmail("testuser");
+        req.setPassword("WrongPass");
+
+        when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(testUser));
+        doThrow(new BadCredentialsException("Bad credentials"))
+                .when(authManager).authenticate(any());
+
+        assertThatThrownBy(() -> authService.login(req, "127.0.0.1", "agent"))
+                .isInstanceOf(BadCredentialsException.class);
+
+        assertThat(testUser.getFailedLoginAttempts()).isEqualTo(5);
+        assertThat(testUser.getLockedUntil()).isAfter(LocalDateTime.now());
+        // A locked account is reported as such to Spring Security (→ 403).
+        assertThat(testUser.isAccountNonLocked()).isFalse();
+        verify(userRepository).save(testUser);
+    }
+
+    @Test
+    @DisplayName("a successful login clears any prior failed-attempt / lockout state")
+    void login_success_resetsFailedAttempts() {
+        testUser.setFailedLoginAttempts(3);
+
+        Auth.LoginRequest req = new Auth.LoginRequest();
+        req.setUsernameOrEmail("testuser");
+        req.setPassword("Test@1234");
+
+        when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(testUser));
+        when(jwtService.generateToken(anyMap(), any())).thenReturn("mock.jwt.token");
+        when(sessionRepository.save(any())).thenReturn(new UserSession());
+
+        authService.login(req, "127.0.0.1", "agent");
+
+        assertThat(testUser.getFailedLoginAttempts()).isZero();
+        assertThat(testUser.getLockedUntil()).isNull();
+        verify(userRepository).save(testUser);   // reset persisted
     }
 
     // ─── updateProfile ──────────────────────────────────────────────────────
