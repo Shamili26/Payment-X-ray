@@ -75,6 +75,17 @@ public class User implements UserDetails {
     @Column(name = "last_login")
     private LocalDateTime lastLogin;
 
+    // ─── Brute-force lockout ─────────────────────────────────────────────────
+
+    // Consecutive failed login attempts. Reset to 0 on a successful login.
+    @Column(name = "failed_login_attempts", nullable = false)
+    private int failedLoginAttempts;
+
+    // When set to a future timestamp, the account is temporarily locked after
+    // too many failed logins; cleared on a successful login. Null = not locked.
+    @Column(name = "locked_until")
+    private LocalDateTime lockedUntil;
+
     // ─── UserDetails implementation ──────────────────────────────────────────
 
     @Override
@@ -99,6 +110,13 @@ public class User implements UserDetails {
 
     @Override
     public boolean isAccountNonLocked() {
+        // Temporarily locked while lockedUntil is in the future (brute-force
+        // lockout); otherwise fall back to the persisted flag. Spring's
+        // DaoAuthenticationProvider checks this BEFORE the password, so a locked
+        // account is rejected with LockedException even with the right password.
+        if (lockedUntil != null && lockedUntil.isAfter(LocalDateTime.now())) {
+            return false;
+        }
         return isAccountNonLocked;
     }
 
