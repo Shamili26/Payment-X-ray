@@ -46,16 +46,16 @@ phases:
       # --- Resolve the artifact version straight from the POM ------------------
       - VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
       - echo "Resolved project version = $VERSION"
-      - test -f "target/payment-app-backend-${VERSION}.jar" || { echo "ERROR: expected jar target/payment-app-backend-${VERSION}.jar not found"; exit 1; }
+      - 'test -f "target/payment-app-backend-${VERSION}.jar" || { echo "ERROR: expected jar target/payment-app-backend-${VERSION}.jar not found"; exit 1; }'
       # --- Regenerate the EB Procfile from that version (never hand-maintained) -
       # ⚠️ A stale jar version, or a dropped --spring.profiles.active=prod /
       #    -Daws.region, causes a boot-time 502 / Secrets-Manager failure.
-      - printf 'web: java -Daws.region=%s -jar payment-app-backend-%s.jar --spring.profiles.active=prod --server.port=5000\n' "$AWS_REGION_TARGET" "$VERSION" > Procfile
+      - 'printf ''web: java -Daws.region=%s -jar payment-app-backend-%s.jar --spring.profiles.active=prod --server.port=5000\n'' "$AWS_REGION_TARGET" "$VERSION" > Procfile'
       - echo "Generated Procfile:" && cat Procfile
       # --- Assert the Procfile is correct BEFORE bundling ----------------------
-      - grep -q -- "--spring.profiles.active=prod" Procfile || { echo "ERROR: Procfile missing --spring.profiles.active=prod"; exit 1; }
-      - grep -q -- "-Daws.region=${AWS_REGION_TARGET}" Procfile || { echo "ERROR: Procfile missing -Daws.region=${AWS_REGION_TARGET}"; exit 1; }
-      - grep -q "payment-app-backend-${VERSION}.jar" Procfile || { echo "ERROR: Procfile jar version mismatch"; exit 1; }
+      - 'grep -q -- "--spring.profiles.active=prod" Procfile || { echo "ERROR: Procfile missing --spring.profiles.active=prod"; exit 1; }'
+      - 'grep -q -- "-Daws.region=${AWS_REGION_TARGET}" Procfile || { echo "ERROR: Procfile missing -Daws.region=${AWS_REGION_TARGET}"; exit 1; }'
+      - 'grep -q "payment-app-backend-${VERSION}.jar" Procfile || { echo "ERROR: Procfile jar version mismatch"; exit 1; }'
       # --- Assemble the EB source bundle (jar + Procfile + .ebextensions) ------
       - rm -rf eb-bundle && mkdir -p eb-bundle/.ebextensions
       - cp "target/payment-app-backend-${VERSION}.jar" eb-bundle/
