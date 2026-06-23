@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# tsc -b build outputs emitted from vite.config.ts / vitest.config.ts (composite
+# project in tsconfig.node.json). Generated on every build — not source.
+# NOTE: eslint.config.js is hand-written source and is intentionally NOT ignored.
+vite.config.js
+vite.config.d.ts
+vitest.config.js
+vitest.config.d.ts
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
