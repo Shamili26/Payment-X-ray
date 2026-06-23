@@ -1,0 +1,99 @@
+# AWS CodeBuild build specification — Payment App FRONTEND (S3 static hosting).
+#
+# Used by the frontend CodePipeline (see infra/frontend-s3-pipeline.yaml):
+#   Source (GitHub) -> Build (this file: test + 80% coverage gate + Vite bundle)
+#   -> Deploy (S3 static-website bucket, via the pipeline's S3 deploy action).
+#
+# This is a SECOND, independent delivery path for the SPA. AWS Amplify Hosting
+# remains the primary host and owns the same-origin /api rewrite + HTTPS
+# (see frontend/amplify.yml); this pipeline publishes the same built bundle to
+# an S3 static-website bucket.
+#
+# Guards (mirrored from amplify.yml — hard-won prod lessons):
+#   * .env.production MUST be BOM-free — a UTF-8 BOM makes Vite silently drop
+#     VITE_API_BASE_URL and the bundle falls back to localhost. Because
+#     .env.production is gitignored, we GENERATE it here from the
+#     VITE_API_BASE_URL env var (default /api), exactly as the backend buildspec
+#     regenerates the EB Procfile — so the value can never drift or arrive with
+#     a BOM.
+#   * The built bundle must contain NO hardcoded elasticbeanstalk API host
+#     (mixed content + dropped Secure cookie).
+version: 0.2
+
+env:
+  variables:
+    # API base baked into the bundle. Same-origin "/api" by default (matches the
+    # Amplify build). Override in the CodeBuild project to point the S3 copy at a
+    # different origin if it is ever served standalone.
+    VITE_API_BASE_URL: "/api"
+  # Provide these via the CodeBuild project env / Secrets Manager to enable SonarQube:
+  #   SONAR_HOST_URL, SONAR_TOKEN
+  parameter-store: {}
+
+phases:
+  install:
+    # Vite 8 requires Node >= 20.19 (or >= 22.12); 18 would fail the build.
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "Toolchain:" && node --version && npm --version
+      - cd frontend
+      - npm ci
+
+  pre_build:
+    commands:
+      # Generate a BOM-free .env.production from the env var (printf, not echo -e,
+      # and no PowerShell — so no UTF-8 BOM is ever introduced).
+      - printf 'VITE_API_BASE_URL=%s\n' "$VITE_API_BASE_URL" > .env.production
+      - echo "Generated .env.production:" && cat .env.production
+      - echo "Guard 1 — .env.production must be BOM-free"
+      - |
+        FIRST3=$(head -c 3 .env.production | od -An -tx1 | tr -d ' ')
+        if [ "$FIRST3" = "efbbbf" ]; then
+          echo "ERROR: .env.production starts with a UTF-8 BOM (EF BB BF)."; exit 1;
+        fi
+      - echo "Guard 2 — VITE_API_BASE_URL must be set"
+      - grep -q '^VITE_API_BASE_URL=.\+$' .env.production || { echo "ERROR: VITE_API_BASE_URL is empty"; exit 1; }
+
+  build:
+    commands:
+      - echo "Running tests with the 80% coverage gate (vitest thresholds -> non-zero exit on miss)..."
+      - npm run coverage
+      - echo "Building production bundle..."
+      - npm run build
+      - echo "Guard 3 — no hardcoded elasticbeanstalk host in the bundle"
+      - |
+        if grep -RqE 'https?://[a-z0-9.-]*elasticbeanstalk' dist/assets; then
+          echo "ERROR: built bundle contains a hardcoded elasticbeanstalk API host"; exit 1;
+        fi
+
+  post_build:
+    commands:
+      # SonarQube analysis — runs only when SONAR_HOST_URL + SONAR_TOKEN are set
+      # (mirrors amplify.yml + the backend buildspec). Reads
+      # frontend/sonar-project.properties (coverage/lcov.info from `npm run coverage`).
+      - |
+        if [ -n "$SONAR_HOST_URL" ] && [ -n "$SONAR_TOKEN" ]; then
+          echo "Running SonarQube analysis...";
+          npx sonar-scanner -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.token="$SONAR_TOKEN";
+        else
+          echo "SONAR_HOST_URL / SONAR_TOKEN not set — skipping SonarQube analysis.";
+        fi
+
+# Code-coverage report surfaced in the CodeBuild "Reports" tab (mirrors the
+# backend's JaCoCo report). `npm run coverage` emits coverage/cobertura-coverage.xml
+# via the cobertura reporter in frontend/vitest.config.ts. The CodeBuild role
+# grants Create/UpdateReport + BatchPutCodeCoverages (see infra/frontend-s3-pipeline.yaml).
+reports:
+  frontend-coverage:
+    files:
+      - cobertura-coverage.xml
+    base-directory: frontend/coverage
+    file-format: COBERTURAXML
+
+# The output artifact = the built SPA. CodePipeline's S3 deploy action extracts
+# these files into the static-website bucket.
+artifacts:
+  base-directory: frontend/dist
+  files:
+    - "**/*"

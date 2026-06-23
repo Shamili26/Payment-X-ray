@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CI/CD for the Payment App FRONTEND (S3 static hosting). Source (GitHub via
+  CodeConnections) -> Build (CodeBuild, buildspec-frontend.yml: test + 80%
+  coverage gate + Vite bundle) -> Deploy (S3 static-website bucket).
+
+  This is a SEPARATE, independent pipeline from the backend
+  (infra/codepipeline-backend.yaml, which deploys to Elastic Beanstalk). AWS
+  Amplify Hosting remains the PRIMARY frontend host and owns the same-origin
+  /api rewrite + HTTPS (see frontend/amplify.yml); this stack publishes the same
+  built SPA to an S3 static-website bucket as an additional delivery target.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: payment-app-frontend
+  GitHubConnectionArn:
+    Type: String
+    Default: arn:aws:codeconnections:us-east-1:975049988202:connection/6605bf57-aeb1-44ae-b865-cd688d8cc413
+    Description: Pre-created & AUTHORIZED CodeConnections (GitHub) connection ARN (shared with the backend pipeline).
+  FullRepositoryId:
+    Type: String
+    Default: Shamili26/Payment-X-ray
+    Description: owner/repo
+  BranchName:
+    Type: String
+    Default: main
+  ViteApiBaseUrl:
+    Type: String
+    Default: "/api"
+    Description: VITE_API_BASE_URL baked into the bundle (same-origin /api by default).
+  # Optional SonarQube wiring; leave blank to skip Sonar analysis in the build.
+  SonarHostUrl:
+    Type: String
+    Default: ""
+  SonarToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+
+Conditions:
+  HasSonar: !Not [!Equals [!Ref SonarHostUrl, ""]]
+
+Resources:
+  # ----------------------------------------------------- static-website bucket
+  # Public-read static website hosting (the option chosen for this stack). For a
+  # locked-down setup, front this bucket with CloudFront + OAC instead and remove
+  # the public bucket policy below.
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-site-${AWS::AccountId}-${AWS::Region}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        # SPA: route 404s back to index.html so client-side rendering handles them.
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        # Allow the public-read bucket POLICY below (ACLs stay blocked).
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadForStaticWebsite
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+
+  # ---------------------------------------------------------------- artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ------------------------------------------------------------ CodeBuild role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}*"
+
+  # --------------------------------------------------------------- build project
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: VITE_API_BASE_URL, Value: !Ref ViteApiBaseUrl }
+          - !If
+            - HasSonar
+            - { Name: SONAR_HOST_URL, Value: !Ref SonarHostUrl }
+            - !Ref AWS::NoValue
+          - !If
+            - HasSonar
+            - { Name: SONAR_TOKEN, Value: !Ref SonarToken }
+            - !Ref AWS::NoValue
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-frontend.yml
+      TimeoutInMinutes: 20
+
+  # ----------------------------------------------------------- CodePipeline role
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # artifact bucket
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # website bucket — the S3 deploy action writes the SPA here
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt WebsiteBucket.Arn
+                  - !Sub "${WebsiteBucket.Arn}/*"
+              # GitHub source via CodeConnections
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              # drive the build
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: !GetAtt BuildProject.Arn
+
+  # ------------------------------------------------------------------- pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: "true"
+              OutputArtifacts: [{ Name: SourceArtifact }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceArtifact }]
+              OutputArtifacts: [{ Name: BuildArtifact }]
+        - Name: Deploy
+          Actions:
+            - Name: DeployToS3
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                BucketName: !Ref WebsiteBucket
+                # Extract the build artifact (the dist/ contents) into the bucket.
+                Extract: "true"
+              InputArtifacts: [{ Name: BuildArtifact }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  WebsiteBucketName:
+    Value: !Ref WebsiteBucket
+  WebsiteURL:
+    Description: S3 static-website endpoint for the SPA.
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
